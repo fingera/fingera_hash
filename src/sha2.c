@@ -1,0 +1,809 @@
+#include <string.h>
+
+#include <fingera/hash/block_impl.h>
+#include <fingera/hash/sha2.h>
+
+static void sha256_transform(uint32_t *s, const void *chunk);
+static void sha512_transform(uint64_t *s, const void *chunk);
+
+static uint32_t sha256_init_digest[8] = {
+    0x6a09e667ul, 0xbb67ae85ul, 0x3c6ef372ul, 0xa54ff53aul,
+    0x510e527ful, 0x9b05688cul, 0x1f83d9abul, 0x5be0cd19ul};
+
+static uint64_t sha512_init_digest[8] = {
+    0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull, 0x3c6ef372fe94f82bull,
+    0xa54ff53a5f1d36f1ull, 0x510e527fade682d1ull, 0x9b05688c2b3e6c1full,
+    0x1f83d9abfb41bd6bull, 0x5be0cd19137e2179ull};
+
+#define write_size writebe64
+#define read_hash htobe32
+
+BLOCK_HASH_INIT_IMPLEMENT(sha256, sha256_init_digest);
+BLOCK_HASH_UPDATE_IMPLEMENT(sha256);
+BLOCK_HASH_FINAL_IMPLEMENT(sha256, uint32_t);
+BLOCK_HASH_ONE_IMPLEMENT(sha256);
+
+#undef write_size
+#undef read_hash
+static inline void write_sha512_size(void *buf_data, uint64_t value) {
+  char *buf = (char *)buf_data;
+  memset(buf, 0, 8);
+  value = htobe64(value);
+  memcpy(buf + 8, &value, sizeof(value));
+}
+#define write_size write_sha512_size
+#define read_hash htobe64
+
+BLOCK_HASH_INIT_IMPLEMENT(sha512, sha512_init_digest);
+BLOCK_HASH_UPDATE_IMPLEMENT(sha512);
+BLOCK_HASH_FINAL_IMPLEMENT(sha512, uint64_t);
+BLOCK_HASH_ONE_IMPLEMENT(sha512);
+
+///////////////////////HMAC256
+void hmac_sha256_init(hmac_sha256_state *state, const void *key, size_t size) {
+  uint8_t rkey[64];
+  sha256_init(&state->inner);
+  sha256_init(&state->outter);
+  if (size <= sizeof(rkey)) {
+    memcpy(rkey, key, size);
+    memset(rkey + size, 0, sizeof(rkey) - size);
+  } else {
+    sha256(key, size, rkey);
+    memset(rkey + 32, 0, 32);
+  }
+  for (int n = 0; n < sizeof(rkey); n++) rkey[n] ^= 0x5c;
+  sha256_update(&state->outter, rkey, sizeof(rkey));
+  for (int n = 0; n < sizeof(rkey); n++) rkey[n] ^= (0x5c ^ 0x36);
+  sha256_update(&state->inner, rkey, sizeof(rkey));
+}
+void hmac_sha256_update(hmac_sha256_state *state, const void *msg,
+                        size_t size) {
+  sha256_update(&state->inner, msg, size);
+}
+void hmac_sha256_final(hmac_sha256_state *state, void *hash32) {
+  assert(state->outter.chunk_size == 0);
+  uint8_t tmp[32];
+  sha256_final(&state->inner, tmp);
+  sha256_update(&state->outter, tmp, sizeof(tmp));
+  sha256_final(&state->outter, hash32);
+}
+
+void hmac_sha256(const void *key, size_t key_size, const void *msg, size_t size,
+                 void *hash32) {
+  hmac_sha256_state state;
+  hmac_sha256_init(&state, key, key_size);
+  hmac_sha256_update(&state, msg, size);
+  hmac_sha256_final(&state, hash32);
+}
+void hmac_sha256_se(const void *key, size_t key_size, const void *msg,
+                    size_t size, void *hash32) {
+  hmac_sha256_state state;
+  hmac_sha256_init(&state, key, key_size);
+  hmac_sha256_update(&state, msg, size);
+  hmac_sha256_final(&state, hash32);
+  cleanse(&state, sizeof(state));
+}
+
+///////////////////////HMAC512
+void hmac_sha512_init(hmac_sha512_state *state, const void *key, size_t size) {
+  unsigned char rkey[128];
+  sha512_init(&state->inner);
+  sha512_init(&state->outter);
+  if (size <= sizeof(rkey)) {
+    memcpy(rkey, key, size);
+    memset(rkey + size, 0, sizeof(rkey) - size);
+  } else {
+    sha512(key, size, rkey);
+    memset(rkey + 64, 0, 64);
+  }
+  for (int n = 0; n < sizeof(rkey); n++) rkey[n] ^= 0x5c;
+  sha512_update(&state->outter, rkey, sizeof(rkey));
+  for (int n = 0; n < sizeof(rkey); n++) rkey[n] ^= 0x5c ^ 0x36;
+  sha512_update(&state->inner, rkey, sizeof(rkey));
+}
+void hmac_sha512_update(hmac_sha512_state *state, const void *msg,
+                        size_t size) {
+  sha512_update(&state->inner, msg, size);
+}
+void hmac_sha512_final(hmac_sha512_state *state, void *hash64) {
+  assert(state->outter.chunk_size == 0);
+  sha512_final(&state->inner, state->outter.chunk);
+  state->outter.chunk_size = 64;
+  sha512_final(&state->outter, hash64);
+}
+
+void hmac_sha512(const void *key, size_t key_size, const void *msg, size_t size,
+                 void *hash64) {
+  hmac_sha512_state state;
+  hmac_sha512_init(&state, key, key_size);
+  hmac_sha512_update(&state, msg, size);
+  hmac_sha512_final(&state, hash64);
+}
+void hmac_sha512_se(const void *key, size_t key_size, const void *msg,
+                    size_t size, void *hash64) {
+  hmac_sha512_state state;
+  hmac_sha512_init(&state, key, key_size);
+  hmac_sha512_update(&state, msg, size);
+  hmac_sha512_final(&state, hash64);
+  cleanse(&state, sizeof(state));
+}
+////////////////////////////////////////////////////////////////////////////////
+/********************************************************************/
+#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define ROL64(x, n) (((x) << (n)) | ((x) >> (64 - (n))))
+
+#define Ch(x, y, z) ((z) ^ ((x) & ((y) ^ (z))))
+#define Maj(x, y, z) (((x) & (y)) | ((z) & ((x) | (y))))
+#define Sigma032(x) (ROL(x, 30) ^ ROL(x, 19) ^ ROL(x, 10))
+#define Sigma132(x) (ROL(x, 26) ^ ROL(x, 21) ^ ROL(x, 7))
+#define sigma032(x) (ROL(x, 25) ^ ROL(x, 14) ^ ((x) >> 3))
+#define sigma132(x) (ROL(x, 15) ^ ROL(x, 13) ^ ((x) >> 10))
+#define Sigma064(x) (ROL64(x, 36) ^ ROL64(x, 30) ^ ROL64(x, 25))
+#define Sigma164(x) (ROL64(x, 50) ^ ROL64(x, 46) ^ ROL64(x, 23))
+#define sigma064(x) (ROL64(x, 63) ^ ROL64(x, 56) ^ ((x) >> 7))
+#define sigma164(x) (ROL64(x, 45) ^ ROL64(x, 3) ^ ((x) >> 6))
+
+#define ROUND32(a, b, c, d, e, f, g, h, k)                       \
+  {                                                              \
+    uint32_t t1 = (h) + Sigma132((e)) + Ch((e), (f), (g)) + (k); \
+    uint32_t t2 = Sigma032((a)) + Maj((a), (b), (c));            \
+    (d) += t1;                                                   \
+    (h) = t1 + t2;                                               \
+  }
+#define ROUND64(a, b, c, d, e, f, g, h, k, w)                          \
+  {                                                                    \
+    uint64_t t1 = (h) + Sigma164((e)) + Ch((e), (f), (g)) + (k) + (w); \
+    uint64_t t2 = Sigma064((a)) + Maj((a), (b), (c));                  \
+    (d) += t1;                                                         \
+    (h) = t1 + t2;                                                     \
+  }
+/********************************************************************/
+
+// 这个函数属于内部使用 btc.c中会调用到
+void _hash256_d64_transform(void *out, const void *in_data) {
+  const char *in = (const char *)in_data;
+  // Transform 1
+  uint32_t a = 0x6a09e667ul;
+  uint32_t b = 0xbb67ae85ul;
+  uint32_t c = 0x3c6ef372ul;
+  uint32_t d = 0xa54ff53aul;
+  uint32_t e = 0x510e527ful;
+  uint32_t f = 0x9b05688cul;
+  uint32_t g = 0x1f83d9abul;
+  uint32_t h = 0x5be0cd19ul;
+
+  uint32_t *result = (uint32_t *)out;
+
+  uint32_t w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15;
+
+  ROUND32(a, b, c, d, e, f, g, h, 0x428a2f98ul + (w0 = readbe32(in + 0)));
+  ROUND32(h, a, b, c, d, e, f, g, 0x71374491ul + (w1 = readbe32(in + 4)));
+  ROUND32(g, h, a, b, c, d, e, f, 0xb5c0fbcful + (w2 = readbe32(in + 8)));
+  ROUND32(f, g, h, a, b, c, d, e, 0xe9b5dba5ul + (w3 = readbe32(in + 12)));
+  ROUND32(e, f, g, h, a, b, c, d, 0x3956c25bul + (w4 = readbe32(in + 16)));
+  ROUND32(d, e, f, g, h, a, b, c, 0x59f111f1ul + (w5 = readbe32(in + 20)));
+  ROUND32(c, d, e, f, g, h, a, b, 0x923f82a4ul + (w6 = readbe32(in + 24)));
+  ROUND32(b, c, d, e, f, g, h, a, 0xab1c5ed5ul + (w7 = readbe32(in + 28)));
+  ROUND32(a, b, c, d, e, f, g, h, 0xd807aa98ul + (w8 = readbe32(in + 32)));
+  ROUND32(h, a, b, c, d, e, f, g, 0x12835b01ul + (w9 = readbe32(in + 36)));
+  ROUND32(g, h, a, b, c, d, e, f, 0x243185beul + (w10 = readbe32(in + 40)));
+  ROUND32(f, g, h, a, b, c, d, e, 0x550c7dc3ul + (w11 = readbe32(in + 44)));
+  ROUND32(e, f, g, h, a, b, c, d, 0x72be5d74ul + (w12 = readbe32(in + 48)));
+  ROUND32(d, e, f, g, h, a, b, c, 0x80deb1feul + (w13 = readbe32(in + 52)));
+  ROUND32(c, d, e, f, g, h, a, b, 0x9bdc06a7ul + (w14 = readbe32(in + 56)));
+  ROUND32(b, c, d, e, f, g, h, a, 0xc19bf174ul + (w15 = readbe32(in + 60)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0xe49b69c1ul + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xefbe4786ul + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x0fc19dc6ul + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x240ca1ccul + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x2de92c6ful + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x4a7484aaul + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x5cb0a9dcul + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x76f988daul + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x983e5152ul + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xa831c66dul + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0xb00327c8ul + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0xbf597fc7ul + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0xc6e00bf3ul + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xd5a79147ul + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x06ca6351ul + (w14 += sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x14292967ul + (w15 += sigma132(w13) + w8 + sigma032(w0)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x27b70a85ul + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x2e1b2138ul + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x4d2c6dfcul + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x53380d13ul + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x650a7354ul + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x766a0abbul + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x81c2c92eul + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x92722c85ul + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0xa2bfe8a1ul + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xa81a664bul + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0xc24b8b70ul + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0xc76c51a3ul + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0xd192e819ul + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xd6990624ul + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0xf40e3585ul + (w14 += sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x106aa070ul + (w15 += sigma132(w13) + w8 + sigma032(w0)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x19a4c116ul + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x1e376c08ul + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x2748774cul + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x34b0bcb5ul + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x391c0cb3ul + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x4ed8aa4aul + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x5b9cca4ful + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x682e6ff3ul + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x748f82eeul + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x78a5636ful + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x84c87814ul + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x8cc70208ul + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x90befffaul + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xa4506cebul + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0xbef9a3f7ul + (w14 + sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0xc67178f2ul + (w15 + sigma132(w13) + w8 + sigma032(w0)));
+
+  a += 0x6a09e667ul;
+  b += 0xbb67ae85ul;
+  c += 0x3c6ef372ul;
+  d += 0xa54ff53aul;
+  e += 0x510e527ful;
+  f += 0x9b05688cul;
+  g += 0x1f83d9abul;
+  h += 0x5be0cd19ul;
+
+  uint32_t t0 = a, t1 = b, t2 = c, t3 = d, t4 = e, t5 = f, t6 = g, t7 = h;
+
+  // Transform 2
+  ROUND32(a, b, c, d, e, f, g, h, 0xc28a2f98ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0x71374491ul);
+  ROUND32(g, h, a, b, c, d, e, f, 0xb5c0fbcful);
+  ROUND32(f, g, h, a, b, c, d, e, 0xe9b5dba5ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x3956c25bul);
+  ROUND32(d, e, f, g, h, a, b, c, 0x59f111f1ul);
+  ROUND32(c, d, e, f, g, h, a, b, 0x923f82a4ul);
+  ROUND32(b, c, d, e, f, g, h, a, 0xab1c5ed5ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0xd807aa98ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0x12835b01ul);
+  ROUND32(g, h, a, b, c, d, e, f, 0x243185beul);
+  ROUND32(f, g, h, a, b, c, d, e, 0x550c7dc3ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x72be5d74ul);
+  ROUND32(d, e, f, g, h, a, b, c, 0x80deb1feul);
+  ROUND32(c, d, e, f, g, h, a, b, 0x9bdc06a7ul);
+  ROUND32(b, c, d, e, f, g, h, a, 0xc19bf374ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0x649b69c1ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0xf0fe4786ul);
+  ROUND32(g, h, a, b, c, d, e, f, 0x0fe1edc6ul);
+  ROUND32(f, g, h, a, b, c, d, e, 0x240cf254ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x4fe9346ful);
+  ROUND32(d, e, f, g, h, a, b, c, 0x6cc984beul);
+  ROUND32(c, d, e, f, g, h, a, b, 0x61b9411eul);
+  ROUND32(b, c, d, e, f, g, h, a, 0x16f988faul);
+  ROUND32(a, b, c, d, e, f, g, h, 0xf2c65152ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0xa88e5a6dul);
+  ROUND32(g, h, a, b, c, d, e, f, 0xb019fc65ul);
+  ROUND32(f, g, h, a, b, c, d, e, 0xb9d99ec7ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x9a1231c3ul);
+  ROUND32(d, e, f, g, h, a, b, c, 0xe70eeaa0ul);
+  ROUND32(c, d, e, f, g, h, a, b, 0xfdb1232bul);
+  ROUND32(b, c, d, e, f, g, h, a, 0xc7353eb0ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0x3069bad5ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0xcb976d5ful);
+  ROUND32(g, h, a, b, c, d, e, f, 0x5a0f118ful);
+  ROUND32(f, g, h, a, b, c, d, e, 0xdc1eeefdul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x0a35b689ul);
+  ROUND32(d, e, f, g, h, a, b, c, 0xde0b7a04ul);
+  ROUND32(c, d, e, f, g, h, a, b, 0x58f4ca9dul);
+  ROUND32(b, c, d, e, f, g, h, a, 0xe15d5b16ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0x007f3e86ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0x37088980ul);
+  ROUND32(g, h, a, b, c, d, e, f, 0xa507ea32ul);
+  ROUND32(f, g, h, a, b, c, d, e, 0x6fab9537ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x17406110ul);
+  ROUND32(d, e, f, g, h, a, b, c, 0x0d8cd6f1ul);
+  ROUND32(c, d, e, f, g, h, a, b, 0xcdaa3b6dul);
+  ROUND32(b, c, d, e, f, g, h, a, 0xc0bbbe37ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0x83613bdaul);
+  ROUND32(h, a, b, c, d, e, f, g, 0xdb48a363ul);
+  ROUND32(g, h, a, b, c, d, e, f, 0x0b02e931ul);
+  ROUND32(f, g, h, a, b, c, d, e, 0x6fd15ca7ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x521afacaul);
+  ROUND32(d, e, f, g, h, a, b, c, 0x31338431ul);
+  ROUND32(c, d, e, f, g, h, a, b, 0x6ed41a95ul);
+  ROUND32(b, c, d, e, f, g, h, a, 0x6d437890ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0xc39c91f2ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0x9eccabbdul);
+  ROUND32(g, h, a, b, c, d, e, f, 0xb5c9a0e6ul);
+  ROUND32(f, g, h, a, b, c, d, e, 0x532fb63cul);
+  ROUND32(e, f, g, h, a, b, c, d, 0xd2c741c6ul);
+  ROUND32(d, e, f, g, h, a, b, c, 0x07237ea3ul);
+  ROUND32(c, d, e, f, g, h, a, b, 0xa4954b68ul);
+  ROUND32(b, c, d, e, f, g, h, a, 0x4c191d76ul);
+
+  w0 = t0 + a;
+  w1 = t1 + b;
+  w2 = t2 + c;
+  w3 = t3 + d;
+  w4 = t4 + e;
+  w5 = t5 + f;
+  w6 = t6 + g;
+  w7 = t7 + h;
+
+  // Transform 3
+  a = 0x6a09e667ul;
+  b = 0xbb67ae85ul;
+  c = 0x3c6ef372ul;
+  d = 0xa54ff53aul;
+  e = 0x510e527ful;
+  f = 0x9b05688cul;
+  g = 0x1f83d9abul;
+  h = 0x5be0cd19ul;
+
+  ROUND32(a, b, c, d, e, f, g, h, 0x428a2f98ul + w0);
+  ROUND32(h, a, b, c, d, e, f, g, 0x71374491ul + w1);
+  ROUND32(g, h, a, b, c, d, e, f, 0xb5c0fbcful + w2);
+  ROUND32(f, g, h, a, b, c, d, e, 0xe9b5dba5ul + w3);
+  ROUND32(e, f, g, h, a, b, c, d, 0x3956c25bul + w4);
+  ROUND32(d, e, f, g, h, a, b, c, 0x59f111f1ul + w5);
+  ROUND32(c, d, e, f, g, h, a, b, 0x923f82a4ul + w6);
+  ROUND32(b, c, d, e, f, g, h, a, 0xab1c5ed5ul + w7);
+  ROUND32(a, b, c, d, e, f, g, h, 0x5807aa98ul);
+  ROUND32(h, a, b, c, d, e, f, g, 0x12835b01ul);
+  ROUND32(g, h, a, b, c, d, e, f, 0x243185beul);
+  ROUND32(f, g, h, a, b, c, d, e, 0x550c7dc3ul);
+  ROUND32(e, f, g, h, a, b, c, d, 0x72be5d74ul);
+  ROUND32(d, e, f, g, h, a, b, c, 0x80deb1feul);
+  ROUND32(c, d, e, f, g, h, a, b, 0x9bdc06a7ul);
+  ROUND32(b, c, d, e, f, g, h, a, 0xc19bf274ul);
+  ROUND32(a, b, c, d, e, f, g, h, 0xe49b69c1ul + (w0 += sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xefbe4786ul + (w1 += 0xa00000ul + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x0fc19dc6ul + (w2 += sigma132(w0) + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x240ca1ccul + (w3 += sigma132(w1) + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x2de92c6ful + (w4 += sigma132(w2) + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x4a7484aaul + (w5 += sigma132(w3) + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x5cb0a9dcul + (w6 += sigma132(w4) + 0x100ul + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x76f988daul + (w7 += sigma132(w5) + w0 + 0x11002000ul));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x983e5152ul + (w8 = 0x80000000ul + sigma132(w6) + w1));
+  ROUND32(h, a, b, c, d, e, f, g, 0xa831c66dul + (w9 = sigma132(w7) + w2));
+  ROUND32(g, h, a, b, c, d, e, f, 0xb00327c8ul + (w10 = sigma132(w8) + w3));
+  ROUND32(f, g, h, a, b, c, d, e, 0xbf597fc7ul + (w11 = sigma132(w9) + w4));
+  ROUND32(e, f, g, h, a, b, c, d, 0xc6e00bf3ul + (w12 = sigma132(w10) + w5));
+  ROUND32(d, e, f, g, h, a, b, c, 0xd5a79147ul + (w13 = sigma132(w11) + w6));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x06ca6351ul + (w14 = sigma132(w12) + w7 + 0x400022ul));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x14292967ul + (w15 = 0x100ul + sigma132(w13) + w8 + sigma032(w0)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x27b70a85ul + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x2e1b2138ul + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x4d2c6dfcul + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x53380d13ul + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x650a7354ul + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x766a0abbul + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x81c2c92eul + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x92722c85ul + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0xa2bfe8a1ul + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xa81a664bul + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0xc24b8b70ul + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0xc76c51a3ul + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0xd192e819ul + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xd6990624ul + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0xf40e3585ul + (w14 += sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x106aa070ul + (w15 += sigma132(w13) + w8 + sigma032(w0)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x19a4c116ul + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x1e376c08ul + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x2748774cul + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x34b0bcb5ul + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x391c0cb3ul + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x4ed8aa4aul + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x5b9cca4ful + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x682e6ff3ul + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x748f82eeul + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x78a5636ful + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x84c87814ul + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x8cc70208ul + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x90befffaul + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xa4506cebul + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0xbef9a3f7ul + (w14 + sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0xc67178f2ul + (w15 + sigma132(w13) + w8 + sigma032(w0)));
+
+  result[0] = htobe32(a + 0x6a09e667ul);
+  result[1] = htobe32(b + 0xbb67ae85ul);
+  result[2] = htobe32(c + 0x3c6ef372ul);
+  result[3] = htobe32(d + 0xa54ff53aul);
+  result[4] = htobe32(e + 0x510e527ful);
+  result[5] = htobe32(f + 0x9b05688cul);
+  result[6] = htobe32(g + 0x1f83d9abul);
+  result[7] = htobe32(h + 0x5be0cd19ul);
+}
+
+static void sha256_transform(uint32_t *s, const void *chunk_data) {
+  const char *chunk = (const char *)chunk_data;
+  uint32_t a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6],
+           h = s[7];
+  uint32_t w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15;
+
+  ROUND32(a, b, c, d, e, f, g, h, 0x428a2f98 + (w0 = readbe32(chunk + 0)));
+  ROUND32(h, a, b, c, d, e, f, g, 0x71374491 + (w1 = readbe32(chunk + 4)));
+  ROUND32(g, h, a, b, c, d, e, f, 0xb5c0fbcf + (w2 = readbe32(chunk + 8)));
+  ROUND32(f, g, h, a, b, c, d, e, 0xe9b5dba5 + (w3 = readbe32(chunk + 12)));
+  ROUND32(e, f, g, h, a, b, c, d, 0x3956c25b + (w4 = readbe32(chunk + 16)));
+  ROUND32(d, e, f, g, h, a, b, c, 0x59f111f1 + (w5 = readbe32(chunk + 20)));
+  ROUND32(c, d, e, f, g, h, a, b, 0x923f82a4 + (w6 = readbe32(chunk + 24)));
+  ROUND32(b, c, d, e, f, g, h, a, 0xab1c5ed5 + (w7 = readbe32(chunk + 28)));
+  ROUND32(a, b, c, d, e, f, g, h, 0xd807aa98 + (w8 = readbe32(chunk + 32)));
+  ROUND32(h, a, b, c, d, e, f, g, 0x12835b01 + (w9 = readbe32(chunk + 36)));
+  ROUND32(g, h, a, b, c, d, e, f, 0x243185be + (w10 = readbe32(chunk + 40)));
+  ROUND32(f, g, h, a, b, c, d, e, 0x550c7dc3 + (w11 = readbe32(chunk + 44)));
+  ROUND32(e, f, g, h, a, b, c, d, 0x72be5d74 + (w12 = readbe32(chunk + 48)));
+  ROUND32(d, e, f, g, h, a, b, c, 0x80deb1fe + (w13 = readbe32(chunk + 52)));
+  ROUND32(c, d, e, f, g, h, a, b, 0x9bdc06a7 + (w14 = readbe32(chunk + 56)));
+  ROUND32(b, c, d, e, f, g, h, a, 0xc19bf174 + (w15 = readbe32(chunk + 60)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0xe49b69c1 + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xefbe4786 + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x0fc19dc6 + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x240ca1cc + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x2de92c6f + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x4a7484aa + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x5cb0a9dc + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x76f988da + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x983e5152 + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xa831c66d + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0xb00327c8 + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0xbf597fc7 + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0xc6e00bf3 + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xd5a79147 + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x06ca6351 + (w14 += sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x14292967 + (w15 += sigma132(w13) + w8 + sigma032(w0)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x27b70a85 + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x2e1b2138 + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x4d2c6dfc + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x53380d13 + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x650a7354 + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x766a0abb + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x81c2c92e + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x92722c85 + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0xa2bfe8a1 + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0xa81a664b + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0xc24b8b70 + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0xc76c51a3 + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0xd192e819 + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xd6990624 + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0xf40e3585 + (w14 += sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x106aa070 + (w15 += sigma132(w13) + w8 + sigma032(w0)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x19a4c116 + (w0 += sigma132(w14) + w9 + sigma032(w1)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x1e376c08 + (w1 += sigma132(w15) + w10 + sigma032(w2)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x2748774c + (w2 += sigma132(w0) + w11 + sigma032(w3)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x34b0bcb5 + (w3 += sigma132(w1) + w12 + sigma032(w4)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x391c0cb3 + (w4 += sigma132(w2) + w13 + sigma032(w5)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0x4ed8aa4a + (w5 += sigma132(w3) + w14 + sigma032(w6)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0x5b9cca4f + (w6 += sigma132(w4) + w15 + sigma032(w7)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0x682e6ff3 + (w7 += sigma132(w5) + w0 + sigma032(w8)));
+  ROUND32(a, b, c, d, e, f, g, h,
+          0x748f82ee + (w8 += sigma132(w6) + w1 + sigma032(w9)));
+  ROUND32(h, a, b, c, d, e, f, g,
+          0x78a5636f + (w9 += sigma132(w7) + w2 + sigma032(w10)));
+  ROUND32(g, h, a, b, c, d, e, f,
+          0x84c87814 + (w10 += sigma132(w8) + w3 + sigma032(w11)));
+  ROUND32(f, g, h, a, b, c, d, e,
+          0x8cc70208 + (w11 += sigma132(w9) + w4 + sigma032(w12)));
+  ROUND32(e, f, g, h, a, b, c, d,
+          0x90befffa + (w12 += sigma132(w10) + w5 + sigma032(w13)));
+  ROUND32(d, e, f, g, h, a, b, c,
+          0xa4506ceb + (w13 += sigma132(w11) + w6 + sigma032(w14)));
+  ROUND32(c, d, e, f, g, h, a, b,
+          0xbef9a3f7 + (w14 + sigma132(w12) + w7 + sigma032(w15)));
+  ROUND32(b, c, d, e, f, g, h, a,
+          0xc67178f2 + (w15 + sigma132(w13) + w8 + sigma032(w0)));
+
+  s[0] += a;
+  s[1] += b;
+  s[2] += c;
+  s[3] += d;
+  s[4] += e;
+  s[5] += f;
+  s[6] += g;
+  s[7] += h;
+}
+
+static void sha512_transform(uint64_t *s, const void *chunk_data) {
+  const char *chunk = (const char *)chunk_data;
+  uint64_t a = s[0], b = s[1], c = s[2], d = s[3], e = s[4], f = s[5], g = s[6],
+           h = s[7];
+  uint64_t w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12, w13, w14, w15;
+
+  ROUND64(a, b, c, d, e, f, g, h, 0x428a2f98d728ae22ull,
+          w0 = readbe64(chunk + 0));
+  ROUND64(h, a, b, c, d, e, f, g, 0x7137449123ef65cdull,
+          w1 = readbe64(chunk + 8));
+  ROUND64(g, h, a, b, c, d, e, f, 0xb5c0fbcfec4d3b2full,
+          w2 = readbe64(chunk + 16));
+  ROUND64(f, g, h, a, b, c, d, e, 0xe9b5dba58189dbbcull,
+          w3 = readbe64(chunk + 24));
+  ROUND64(e, f, g, h, a, b, c, d, 0x3956c25bf348b538ull,
+          w4 = readbe64(chunk + 32));
+  ROUND64(d, e, f, g, h, a, b, c, 0x59f111f1b605d019ull,
+          w5 = readbe64(chunk + 40));
+  ROUND64(c, d, e, f, g, h, a, b, 0x923f82a4af194f9bull,
+          w6 = readbe64(chunk + 48));
+  ROUND64(b, c, d, e, f, g, h, a, 0xab1c5ed5da6d8118ull,
+          w7 = readbe64(chunk + 56));
+  ROUND64(a, b, c, d, e, f, g, h, 0xd807aa98a3030242ull,
+          w8 = readbe64(chunk + 64));
+  ROUND64(h, a, b, c, d, e, f, g, 0x12835b0145706fbeull,
+          w9 = readbe64(chunk + 72));
+  ROUND64(g, h, a, b, c, d, e, f, 0x243185be4ee4b28cull,
+          w10 = readbe64(chunk + 80));
+  ROUND64(f, g, h, a, b, c, d, e, 0x550c7dc3d5ffb4e2ull,
+          w11 = readbe64(chunk + 88));
+  ROUND64(e, f, g, h, a, b, c, d, 0x72be5d74f27b896full,
+          w12 = readbe64(chunk + 96));
+  ROUND64(d, e, f, g, h, a, b, c, 0x80deb1fe3b1696b1ull,
+          w13 = readbe64(chunk + 104));
+  ROUND64(c, d, e, f, g, h, a, b, 0x9bdc06a725c71235ull,
+          w14 = readbe64(chunk + 112));
+  ROUND64(b, c, d, e, f, g, h, a, 0xc19bf174cf692694ull,
+          w15 = readbe64(chunk + 120));
+  ROUND64(a, b, c, d, e, f, g, h, 0xe49b69c19ef14ad2ull,
+          w0 += sigma164(w14) + w9 + sigma064(w1));
+  ROUND64(h, a, b, c, d, e, f, g, 0xefbe4786384f25e3ull,
+          w1 += sigma164(w15) + w10 + sigma064(w2));
+  ROUND64(g, h, a, b, c, d, e, f, 0x0fc19dc68b8cd5b5ull,
+          w2 += sigma164(w0) + w11 + sigma064(w3));
+  ROUND64(f, g, h, a, b, c, d, e, 0x240ca1cc77ac9c65ull,
+          w3 += sigma164(w1) + w12 + sigma064(w4));
+  ROUND64(e, f, g, h, a, b, c, d, 0x2de92c6f592b0275ull,
+          w4 += sigma164(w2) + w13 + sigma064(w5));
+  ROUND64(d, e, f, g, h, a, b, c, 0x4a7484aa6ea6e483ull,
+          w5 += sigma164(w3) + w14 + sigma064(w6));
+  ROUND64(c, d, e, f, g, h, a, b, 0x5cb0a9dcbd41fbd4ull,
+          w6 += sigma164(w4) + w15 + sigma064(w7));
+  ROUND64(b, c, d, e, f, g, h, a, 0x76f988da831153b5ull,
+          w7 += sigma164(w5) + w0 + sigma064(w8));
+  ROUND64(a, b, c, d, e, f, g, h, 0x983e5152ee66dfabull,
+          w8 += sigma164(w6) + w1 + sigma064(w9));
+  ROUND64(h, a, b, c, d, e, f, g, 0xa831c66d2db43210ull,
+          w9 += sigma164(w7) + w2 + sigma064(w10));
+  ROUND64(g, h, a, b, c, d, e, f, 0xb00327c898fb213full,
+          w10 += sigma164(w8) + w3 + sigma064(w11));
+  ROUND64(f, g, h, a, b, c, d, e, 0xbf597fc7beef0ee4ull,
+          w11 += sigma164(w9) + w4 + sigma064(w12));
+  ROUND64(e, f, g, h, a, b, c, d, 0xc6e00bf33da88fc2ull,
+          w12 += sigma164(w10) + w5 + sigma064(w13));
+  ROUND64(d, e, f, g, h, a, b, c, 0xd5a79147930aa725ull,
+          w13 += sigma164(w11) + w6 + sigma064(w14));
+  ROUND64(c, d, e, f, g, h, a, b, 0x06ca6351e003826full,
+          w14 += sigma164(w12) + w7 + sigma064(w15));
+  ROUND64(b, c, d, e, f, g, h, a, 0x142929670a0e6e70ull,
+          w15 += sigma164(w13) + w8 + sigma064(w0));
+  ROUND64(a, b, c, d, e, f, g, h, 0x27b70a8546d22ffcull,
+          w0 += sigma164(w14) + w9 + sigma064(w1));
+  ROUND64(h, a, b, c, d, e, f, g, 0x2e1b21385c26c926ull,
+          w1 += sigma164(w15) + w10 + sigma064(w2));
+  ROUND64(g, h, a, b, c, d, e, f, 0x4d2c6dfc5ac42aedull,
+          w2 += sigma164(w0) + w11 + sigma064(w3));
+  ROUND64(f, g, h, a, b, c, d, e, 0x53380d139d95b3dfull,
+          w3 += sigma164(w1) + w12 + sigma064(w4));
+  ROUND64(e, f, g, h, a, b, c, d, 0x650a73548baf63deull,
+          w4 += sigma164(w2) + w13 + sigma064(w5));
+  ROUND64(d, e, f, g, h, a, b, c, 0x766a0abb3c77b2a8ull,
+          w5 += sigma164(w3) + w14 + sigma064(w6));
+  ROUND64(c, d, e, f, g, h, a, b, 0x81c2c92e47edaee6ull,
+          w6 += sigma164(w4) + w15 + sigma064(w7));
+  ROUND64(b, c, d, e, f, g, h, a, 0x92722c851482353bull,
+          w7 += sigma164(w5) + w0 + sigma064(w8));
+  ROUND64(a, b, c, d, e, f, g, h, 0xa2bfe8a14cf10364ull,
+          w8 += sigma164(w6) + w1 + sigma064(w9));
+  ROUND64(h, a, b, c, d, e, f, g, 0xa81a664bbc423001ull,
+          w9 += sigma164(w7) + w2 + sigma064(w10));
+  ROUND64(g, h, a, b, c, d, e, f, 0xc24b8b70d0f89791ull,
+          w10 += sigma164(w8) + w3 + sigma064(w11));
+  ROUND64(f, g, h, a, b, c, d, e, 0xc76c51a30654be30ull,
+          w11 += sigma164(w9) + w4 + sigma064(w12));
+  ROUND64(e, f, g, h, a, b, c, d, 0xd192e819d6ef5218ull,
+          w12 += sigma164(w10) + w5 + sigma064(w13));
+  ROUND64(d, e, f, g, h, a, b, c, 0xd69906245565a910ull,
+          w13 += sigma164(w11) + w6 + sigma064(w14));
+  ROUND64(c, d, e, f, g, h, a, b, 0xf40e35855771202aull,
+          w14 += sigma164(w12) + w7 + sigma064(w15));
+  ROUND64(b, c, d, e, f, g, h, a, 0x106aa07032bbd1b8ull,
+          w15 += sigma164(w13) + w8 + sigma064(w0));
+  ROUND64(a, b, c, d, e, f, g, h, 0x19a4c116b8d2d0c8ull,
+          w0 += sigma164(w14) + w9 + sigma064(w1));
+  ROUND64(h, a, b, c, d, e, f, g, 0x1e376c085141ab53ull,
+          w1 += sigma164(w15) + w10 + sigma064(w2));
+  ROUND64(g, h, a, b, c, d, e, f, 0x2748774cdf8eeb99ull,
+          w2 += sigma164(w0) + w11 + sigma064(w3));
+  ROUND64(f, g, h, a, b, c, d, e, 0x34b0bcb5e19b48a8ull,
+          w3 += sigma164(w1) + w12 + sigma064(w4));
+  ROUND64(e, f, g, h, a, b, c, d, 0x391c0cb3c5c95a63ull,
+          w4 += sigma164(w2) + w13 + sigma064(w5));
+  ROUND64(d, e, f, g, h, a, b, c, 0x4ed8aa4ae3418acbull,
+          w5 += sigma164(w3) + w14 + sigma064(w6));
+  ROUND64(c, d, e, f, g, h, a, b, 0x5b9cca4f7763e373ull,
+          w6 += sigma164(w4) + w15 + sigma064(w7));
+  ROUND64(b, c, d, e, f, g, h, a, 0x682e6ff3d6b2b8a3ull,
+          w7 += sigma164(w5) + w0 + sigma064(w8));
+  ROUND64(a, b, c, d, e, f, g, h, 0x748f82ee5defb2fcull,
+          w8 += sigma164(w6) + w1 + sigma064(w9));
+  ROUND64(h, a, b, c, d, e, f, g, 0x78a5636f43172f60ull,
+          w9 += sigma164(w7) + w2 + sigma064(w10));
+  ROUND64(g, h, a, b, c, d, e, f, 0x84c87814a1f0ab72ull,
+          w10 += sigma164(w8) + w3 + sigma064(w11));
+  ROUND64(f, g, h, a, b, c, d, e, 0x8cc702081a6439ecull,
+          w11 += sigma164(w9) + w4 + sigma064(w12));
+  ROUND64(e, f, g, h, a, b, c, d, 0x90befffa23631e28ull,
+          w12 += sigma164(w10) + w5 + sigma064(w13));
+  ROUND64(d, e, f, g, h, a, b, c, 0xa4506cebde82bde9ull,
+          w13 += sigma164(w11) + w6 + sigma064(w14));
+  ROUND64(c, d, e, f, g, h, a, b, 0xbef9a3f7b2c67915ull,
+          w14 += sigma164(w12) + w7 + sigma064(w15));
+  ROUND64(b, c, d, e, f, g, h, a, 0xc67178f2e372532bull,
+          w15 += sigma164(w13) + w8 + sigma064(w0));
+  ROUND64(a, b, c, d, e, f, g, h, 0xca273eceea26619cull,
+          w0 += sigma164(w14) + w9 + sigma064(w1));
+  ROUND64(h, a, b, c, d, e, f, g, 0xd186b8c721c0c207ull,
+          w1 += sigma164(w15) + w10 + sigma064(w2));
+  ROUND64(g, h, a, b, c, d, e, f, 0xeada7dd6cde0eb1eull,
+          w2 += sigma164(w0) + w11 + sigma064(w3));
+  ROUND64(f, g, h, a, b, c, d, e, 0xf57d4f7fee6ed178ull,
+          w3 += sigma164(w1) + w12 + sigma064(w4));
+  ROUND64(e, f, g, h, a, b, c, d, 0x06f067aa72176fbaull,
+          w4 += sigma164(w2) + w13 + sigma064(w5));
+  ROUND64(d, e, f, g, h, a, b, c, 0x0a637dc5a2c898a6ull,
+          w5 += sigma164(w3) + w14 + sigma064(w6));
+  ROUND64(c, d, e, f, g, h, a, b, 0x113f9804bef90daeull,
+          w6 += sigma164(w4) + w15 + sigma064(w7));
+  ROUND64(b, c, d, e, f, g, h, a, 0x1b710b35131c471bull,
+          w7 += sigma164(w5) + w0 + sigma064(w8));
+  ROUND64(a, b, c, d, e, f, g, h, 0x28db77f523047d84ull,
+          w8 += sigma164(w6) + w1 + sigma064(w9));
+  ROUND64(h, a, b, c, d, e, f, g, 0x32caab7b40c72493ull,
+          w9 += sigma164(w7) + w2 + sigma064(w10));
+  ROUND64(g, h, a, b, c, d, e, f, 0x3c9ebe0a15c9bebcull,
+          w10 += sigma164(w8) + w3 + sigma064(w11));
+  ROUND64(f, g, h, a, b, c, d, e, 0x431d67c49c100d4cull,
+          w11 += sigma164(w9) + w4 + sigma064(w12));
+  ROUND64(e, f, g, h, a, b, c, d, 0x4cc5d4becb3e42b6ull,
+          w12 += sigma164(w10) + w5 + sigma064(w13));
+  ROUND64(d, e, f, g, h, a, b, c, 0x597f299cfc657e2aull,
+          w13 += sigma164(w11) + w6 + sigma064(w14));
+  ROUND64(c, d, e, f, g, h, a, b, 0x5fcb6fab3ad6faecull,
+          w14 + sigma164(w12) + w7 + sigma064(w15));
+  ROUND64(b, c, d, e, f, g, h, a, 0x6c44198c4a475817ull,
+          w15 + sigma164(w13) + w8 + sigma064(w0));
+
+  s[0] += a;
+  s[1] += b;
+  s[2] += c;
+  s[3] += d;
+  s[4] += e;
+  s[5] += f;
+  s[6] += g;
+  s[7] += h;
+}
