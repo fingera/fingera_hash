@@ -34,3 +34,16 @@ void btc_bip32_hash(const void *chain_code, uint32_t child, uint8_t header,
   hmac_sha512_se(chain_code, 32, buffer, sizeof(buffer), out64);
   cleanse(buffer, sizeof(buffer));
 }
+
+// 在 sha2.c 中实现
+void _hash256_d64_transform(void *out, const void *in);
+
+void btc_hash256_d64(void *out, const void *in, size_t blocks) {
+  char *_out = (char *)out;
+  const char *_in = (const char *)in;
+  while (blocks--) {
+    _hash256_d64_transform(_out, _in);
+    _out += 32;
+    _in += 64;
+  }
+}

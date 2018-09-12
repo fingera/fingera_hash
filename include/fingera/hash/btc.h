@@ -29,11 +29,13 @@ void btc_hash160_se(const void *msg, size_t size, void *hash20);
 #define btc_hash256_update sha256_update
 void btc_hash256_final(btc_hash256_state *state, void *hash32);
 
-void btc_hash256(const void *msg, size_t size, void *hash20);
-void btc_hash256_se(const void *msg, size_t size, void *hash20);
+void btc_hash256(const void *msg, size_t size, void *hash32);
+void btc_hash256_se(const void *msg, size_t size, void *hash32);
 
 void btc_bip32_hash(const void *chain_code, uint32_t child, uint8_t header,
                     const void *data32, void *out64);
+
+void btc_hash256_d64(void *out, const void *in, size_t blocks);
 
 FINGERA_EXTERN_C_END
 

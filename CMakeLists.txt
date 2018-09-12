@@ -2,13 +2,11 @@ cmake_minimum_required(VERSION 3.5)
 
 option(BUILD_TESTING "Enable test (depends on googletest)." OFF)
 option(BUILD_VALGRIND "Enable valgrind (depends on BUILD_TESTING)." OFF)
+option(BUILD_EXTERNAL "Enable build external" ON)
 
-if ("${CMAKE_C_COMPILER_ID}" STREQUAL "MSVC")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /utf-8")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
+if (${BUILD_EXTERNAL} STREQUAL "ON")
+  add_subdirectory(external)
 endif()
-
-add_subdirectory(external)
 
 add_library(fingera_hash
   src/ripemd160.c
