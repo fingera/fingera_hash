@@ -38,7 +38,7 @@ void btc_bip32_hash(const void *chain_code, uint32_t child, uint8_t header,
 // 在 sha2.c 中实现
 void _hash256_d64_transform(void *out, const void *in);
 
-void btc_hash256_d64(void *out, const void *in, size_t blocks) {
+void btc_merkletree_hash(void *out, const void *in, size_t blocks) {
   char *_out = (char *)out;
   const char *_in = (const char *)in;
   while (blocks--) {

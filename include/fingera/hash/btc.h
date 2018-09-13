@@ -35,7 +35,7 @@ void btc_hash256_se(const void *msg, size_t size, void *hash32);
 void btc_bip32_hash(const void *chain_code, uint32_t child, uint8_t header,
                     const void *data32, void *out64);
 
-void btc_hash256_d64(void *out, const void *in, size_t blocks);
+void btc_merkletree_hash(void *out, const void *in, size_t blocks);
 
 FINGERA_EXTERN_C_END
 

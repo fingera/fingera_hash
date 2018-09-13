@@ -35,7 +35,7 @@ TEST(btc, d64) {
     for (int j = 0; j < i; ++j) {
       btc_hash256(in + 64 * j, 64, out1 + 32 * j);
     }
-    btc_hash256_d64(out2, in, i);
+    btc_merkletree_hash(out2, in, i);
     EXPECT_ZERO(memcmp(out1, out2, 32 * i));
   }
 }
